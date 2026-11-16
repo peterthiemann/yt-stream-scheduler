@@ -2,6 +2,8 @@
 
 `schedule-stream` creates and binds unlisted YouTube Live broadcasts through the YouTube Data API v3. The recurring slots are Tuesday at 10:15 and Wednesday at 13:00 in `Europe/Berlin`.
 
+Read the [Privacy Policy](https://github.com/peterthiemann/yt-stream-scheduler/blob/main/PRIVACY.md) before authorizing YouTube access.
+
 ## Install on macOS
 
 Use Python 3.11 or later. From this directory, install the executable into your personal bin directory. Add the final line to `~/.zshrc` to keep it on your path in new Terminal sessions.
