@@ -27,6 +27,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 UTC = timezone.utc
 SLOTS = {1: time(10, 15), 2: time(13)}
 CONFIG_DIR = Path.home() / "Library" / "Application Support" / "schedule-stream"
+PRIVACY_POLICY_URL = "https://github.com/peterthiemann/yt-stream-scheduler/blob/main/PRIVACY.md"
+PRIVACY_POLICY_VERSION = 1
+YOUTUBE_TERMS_URL = "https://www.youtube.com/t/terms"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 API_URL = "https://www.googleapis.com/youtube/v3/"
@@ -389,7 +392,31 @@ def save_config(config):
         temporary.unlink(missing_ok=True)
 
 
+def load_config():
+    try:
+        with (CONFIG_DIR / "config.json").open(encoding="utf-8") as file:
+            config = json.load(file)
+    except (FileNotFoundError, ValueError):
+        return {}
+    if not isinstance(config, dict):
+        return {}
+
+    legacy_fields = {"channel_id", "stream_id", "settings"}
+    if legacy_fields.intersection(config):
+        config = {key: value for key, value in config.items() if key not in legacy_fields}
+        save_config(config)
+    return config
+
+
 def setup(credentials):
+    with local_lock():
+        load_config()  # Discard old cached data even if setup is cancelled.
+
+    stderr(f"schedule-stream Privacy Policy: {PRIVACY_POLICY_URL}")
+    stderr(f"YouTube Terms of Service: {YOUTUBE_TERMS_URL}")
+    if prompt("Do you accept the schedule-stream Privacy Policy? [y/N] ").lower() not in ("y", "yes"):
+        raise ToolError("Setup cancelled. Accept the Privacy Policy to use schedule-stream.")
+
     downloaded = read_json(credentials.expanduser(), "Could not read the Desktop OAuth credentials JSON.")
     try:
         installed = downloaded["installed"]
@@ -410,7 +437,8 @@ def setup(credentials):
             stderr(str(error))
         else:
             stderr(f"Authorized channel: {channel_name} ({channel_id})")
-            if prompt("Use this channel? [y/N] ").lower() in ("y", "yes"):
+            expected_channel_id = prompt("Enter the channel ID to confirm it (blank to decline): ")
+            if expected_channel_id == channel_id:
                 break
         if prompt("Restart Google sign-in? [Y/n] ").lower() not in ("", "y", "yes"):
             raise ToolError("Setup cancelled.")
@@ -420,17 +448,19 @@ def setup(credentials):
         if not value:
             raise ToolError("Setup cancelled.")
         try:
-            stream_id, settings = youtube.template(video_id_from_url(value), channel_id)
+            template_id = video_id_from_url(value)
+            youtube.template(template_id, expected_channel_id)
             break
         except TemplateError as error:
             stderr(f"{error} Try a different broadcast.")
 
     with local_lock():
         save_config({
-            "client": client, "refresh_token": tokens["refresh_token"], "channel_id": channel_id,
-            "stream_id": stream_id, "settings": settings,
+            "client": client, "refresh_token": tokens["refresh_token"],
+            "expected_channel_id": expected_channel_id, "template_id": template_id,
+            "privacy_policy_version": PRIVACY_POLICY_VERSION,
         })
-    stderr("Setup complete. The confirmed channel and reusable stream were saved.")
+    stderr("Setup complete. The confirmed channel ID and template selection were saved.")
 
 
 def show_slot(slot):
@@ -484,21 +514,21 @@ def check_existing(broadcasts, slot, title, stream_id):
     raise ToolError(f"Conflict at {show_slot(slot)}. The slot is occupied by {ids}.")
 
 
-def create_or_recover(youtube, config, slot, title, diagnostic):
+def create_or_recover(youtube, channel_id, stream_id, settings, slot, title, diagnostic):
     try:
-        broadcast = youtube.insert(insert_body(config["settings"], title, slot))
+        broadcast = youtube.insert(insert_body(settings, title, slot))
     except ApiError as error:
         if not error.ambiguous:
             raise
         retry = f"Retry with --date {slot.date()} and the same title."
         diagnostic("Creation was uncertain. Checking the same slot on YouTube.")
         try:
-            occupied = broadcasts_by_slot(youtube, config["channel_id"])
+            occupied = broadcasts_by_slot(youtube, channel_id)
         except ToolError as check_error:
             raise ToolError(
                 f"Creation at {show_slot(slot)} is uncertain. {check_error} {retry}"
             ) from None
-        existing = check_existing(occupied.get(slot), slot, title, config["stream_id"])
+        existing = check_existing(occupied.get(slot), slot, title, stream_id)
         if existing is None:
             raise ToolError(
                 f"Creation at {show_slot(slot)} is uncertain. YouTube lists no broadcast "
@@ -520,37 +550,40 @@ def schedule(youtube, config, title, requested_date, dry_run, verbose, now):
 
     channel_id, channel_name = youtube.channel()
     diagnostic(f"Authorized channel: {channel_name} ({channel_id})")
-    if channel_id != config["channel_id"]:
+    if channel_id != config["expected_channel_id"]:
         raise ToolError(
             f"Channel mismatch. Google authorized {channel_name} ({channel_id}). "
-            f"Expected {config['channel_id']}. Run setup to sign in again."
+            f"Expected {config['expected_channel_id']}. Run setup to sign in again."
         )
 
+    try:
+        stream_id, settings = youtube.template(config["template_id"], channel_id)
+    except TemplateError as error:
+        raise ToolError(f"{error} Run setup to choose a usable template broadcast.") from None
     occupied = broadcasts_by_slot(youtube, channel_id)
     slot = select_slot(now, berlin, requested_date, occupied, diagnostic)
     if verbose or dry_run:
         stderr(f"Selected slot: {show_slot(slot)}.")
-    stream_id = config["stream_id"]
     existing = check_existing(occupied.get(slot), slot, title, stream_id)
 
     if dry_run:
         if existing is None:
-            stderr(f"Would create an unlisted broadcast titled {title!r} and bind the saved stream.")
+            stderr(f"Would create an unlisted broadcast titled {title!r} and bind the template's stream.")
         elif bound_stream(existing) == stream_id:
-            stderr(f"Would reuse broadcast {existing['id']}. The saved stream is already bound.")
+            stderr(f"Would reuse broadcast {existing['id']}. The template's stream is already bound.")
         else:
-            stderr(f"Would reuse broadcast {existing['id']} and bind the saved stream.")
+            stderr(f"Would reuse broadcast {existing['id']} and bind the template's stream.")
         return None
 
     if existing is not None:
         broadcast = existing
         diagnostic(f"Reused broadcast {broadcast['id']}.")
     else:
-        broadcast = create_or_recover(youtube, config, slot, title, diagnostic)
+        broadcast = create_or_recover(youtube, channel_id, stream_id, settings, slot, title, diagnostic)
     broadcast_id = broadcast["id"]
     binding = bound_stream(broadcast)
     if binding == stream_id:
-        diagnostic("The saved stream is already bound.")
+        diagnostic("The template's stream is already bound.")
     elif binding:
         raise ToolError(f"Conflict at {show_slot(slot)}. Broadcast {broadcast_id} has a different stream.")
     else:
@@ -561,7 +594,7 @@ def schedule(youtube, config, title, requested_date, dry_run, verbose, now):
                 f"Binding failed for broadcast {broadcast_id} at {show_slot(slot)}. {error} "
                 f"Retry with --date {slot.date()} and the same title."
             ) from None
-        diagnostic("Bound the saved stream.")
+        diagnostic("Bound the template's stream.")
     return f"https://www.youtube.com/watch?v={broadcast_id}"
 
 
@@ -586,6 +619,7 @@ def main(argv=None):
         parser = argparse.ArgumentParser(
             prog="schedule-stream",
             description="Schedule an unlisted YouTube Live broadcast (run schedule-stream setup first).",
+            epilog=f"Privacy Policy: {PRIVACY_POLICY_URL}",
         )
         parser.add_argument("title", help="title for this broadcast")
         parser.add_argument("--date", type=parse_date, help="future slot date (YYYY-MM-DD, Europe/Berlin)")
@@ -596,10 +630,12 @@ def main(argv=None):
             parser.error("title must contain 1 to 100 characters and cannot be blank")
 
         with local_lock():
-            config = read_json(
-                CONFIG_DIR / "config.json",
-                "Could not read saved setup. Run schedule-stream setup --credentials PATH.",
-            )
+            config = load_config()
+            if config.get("privacy_policy_version") != PRIVACY_POLICY_VERSION or not config.get("template_id"):
+                raise ToolError(
+                    "Run schedule-stream setup --credentials PATH to accept the current Privacy Policy "
+                    "and select a template."
+                )
             tokens = oauth_token(
                 config["client"], grant_type="refresh_token", refresh_token=config["refresh_token"],
             )

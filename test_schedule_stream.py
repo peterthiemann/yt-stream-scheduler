@@ -23,16 +23,11 @@ STREAM = "reusable-stream"
 TEMPLATE = "template123"
 TITLE = "Lecture 7: Type Inference"
 CONFIG = {
-    "channel_id": CHANNEL,
-    "stream_id": STREAM,
+    "expected_channel_id": CHANNEL,
+    "template_id": TEMPLATE,
+    "privacy_policy_version": tool.PRIVACY_POLICY_VERSION,
     "client": {"client_id": "client", "client_secret": "client-secret"},
     "refresh_token": "refresh-token",
-    "settings": {
-        "snippet": {"description": "Lecture series", "categoryId": "27"},
-        "status": {"selfDeclaredMadeForKids": False},
-        "contentDetails": {"enableDvr": False, "enableAutoStart": True},
-        "durationSeconds": 3600,
-    },
 }
 
 
@@ -58,6 +53,14 @@ class MockGoogle:
         self.bind_error = None
         self.insert_error = None
         self.commit_on_insert_error = False
+        self.template = broadcast(TEMPLATE, "2026-03-18T12:00:00Z", stream=STREAM)
+        self.template["snippet"].update({
+            "description": "Lecture series",
+            "categoryId": "27",
+            "scheduledEndTime": "2026-03-18T13:00:00Z",
+        })
+        self.template["status"]["selfDeclaredMadeForKids"] = False
+        self.template["contentDetails"].update({"enableDvr": False, "enableAutoStart": True})
         self.stream = {
             "id": STREAM,
             "snippet": {"channelId": CHANNEL},
@@ -80,11 +83,14 @@ class MockGoogle:
                 assert query["mine"] == "true"
                 return {"items": [{"id": self.channel_id, "snippet": {"title": "Lecture channel"}}]}
             if resource == "liveStreams":
-                assert query["id"] == STREAM
+                assert query["id"] == self.stream["id"]
                 assert "cdn" not in query["part"]
                 return {"items": [deepcopy(self.stream)]}
             if "id" in query:
-                return {"items": deepcopy([item for item in self.items if item["id"] == query["id"]])}
+                matches = [item for item in self.items if item["id"] == query["id"]]
+                if not matches and self.template and query["id"] == self.template["id"]:
+                    matches = [self.template]
+                return {"items": deepcopy(matches)}
 
             assert query["broadcastStatus"] == "upcoming"
             # Return a single broadcast per page, including unbound and Studio-created events.
@@ -147,7 +153,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("Skipped occupied slot 2026-11-18 13:00 CET", err)
         self.assertIn("Authorized channel: Lecture channel", err)
         self.assertIn("Created broadcast video000003", err)
-        self.assertIn("Bound the saved stream", err)
+        self.assertIn("Bound the template's stream", err)
         self.assertNotIn("private-access-token", err + out)
 
     def test_studio_broadcasts_use_pagination_and_match_by_instant(self):
@@ -237,7 +243,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("Recovered broadcast", err)
         self.assertIn("video000001", out)
         self.assertEqual([name for name, _ in self.google.reads],
-                         ["channels", "liveBroadcasts", "liveBroadcasts"])
+                         ["channels", "liveBroadcasts", "liveStreams", "liveBroadcasts", "liveBroadcasts"])
         self.assertEqual([name for name, _, _ in self.google.writes],
                          ["liveBroadcasts", "liveBroadcasts/bind"])
 
@@ -267,7 +273,7 @@ class ScheduleTests(unittest.TestCase):
 
         sign_in = patch.object(tool, "sign_in", return_value=tokens)
         with sign_in as auth, patch("builtins.input", side_effect=[
-            "n", "y", "y", "https://youtu.be/unbound0001", watch,
+            "yes", "", "y", CHANNEL, "https://youtu.be/unbound0001", watch,
         ]):
             status, out, err = self.run_cli("setup", "--credentials", str(credentials_path))
         self.assertEqual((status, out), (0, ""), err)
@@ -278,13 +284,72 @@ class ScheduleTests(unittest.TestCase):
         saved_path = self.config_dir / "config.json"
         self.assertEqual(saved_path.stat().st_mode & 0o777, 0o600)
         saved = json.loads(saved_path.read_text())
-        self.assertEqual(saved["stream_id"], STREAM)
-        self.assertEqual(saved["settings"]["snippet"], {"description": "Template description"})
-        self.assertEqual(saved["settings"]["contentDetails"], {
+        self.assertEqual(saved, CONFIG)
+        _, settings = tool.YouTube("private-access-token").template(TEMPLATE, CHANNEL)
+        self.assertEqual(settings["snippet"], {"description": "Template description"})
+        self.assertEqual(settings["contentDetails"], {
             "monitorStream": {"enableMonitorStream": False},
             "closedCaptionsType": "closedCaptionsEmbedded",
             "latencyPreference": "normal",
         })
+
+    def test_declining_privacy_policy_stops_setup_before_oauth(self):
+        original = (self.config_dir / "config.json").read_bytes()
+        with patch.object(tool, "sign_in") as auth, patch("builtins.input", return_value=""):
+            status, out, err = self.run_cli("setup", "--credentials", "unused.json")
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn(tool.PRIVACY_POLICY_URL, err)
+        self.assertIn("Accept the Privacy Policy", err)
+        auth.assert_not_called()
+        self.assertEqual((self.config_dir / "config.json").read_bytes(), original)
+
+    def test_legacy_metadata_is_removed_before_oauth_or_policy_acceptance(self):
+        legacy = {
+            "client": CONFIG["client"], "refresh_token": CONFIG["refresh_token"],
+            "channel_id": CHANNEL, "stream_id": STREAM, "settings": {"snippet": {"description": "Old"}},
+        }
+        for args in ((TITLE, "--dry-run"), ("setup", "--credentials", "unused.json")):
+            with self.subTest(args=args):
+                tool.save_config(legacy)
+                with patch.object(tool, "oauth_token") as refresh, patch.object(tool, "sign_in") as sign_in, \
+                        patch("builtins.input", return_value="n"):
+                    status, out, err = self.run_cli(*args)
+                self.assertEqual((status, out), (1, ""))
+                self.assertIn("Privacy Policy", err)
+                refresh.assert_not_called()
+                sign_in.assert_not_called()
+                self.assertEqual(json.loads((self.config_dir / "config.json").read_text()), {
+                    "client": CONFIG["client"], "refresh_token": CONFIG["refresh_token"],
+                })
+
+    def test_old_policy_acceptance_requires_setup_before_oauth(self):
+        tool.save_config({**CONFIG, "privacy_policy_version": 0})
+        with patch.object(tool, "oauth_token") as refresh:
+            status, out, err = self.run_cli(TITLE)
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn("accept the current Privacy Policy", err)
+        refresh.assert_not_called()
+
+    def test_reads_current_template_and_stream_after_more_than_30_days(self):
+        status, _, err = self.run_cli(TITLE)
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.google.items[-1]["snippet"]["description"], "Lecture series")
+        current_stream = "replacement-stream"
+        self.google.template["snippet"]["description"] = "Updated description"
+        self.google.template["contentDetails"]["boundStreamId"] = current_stream
+        self.google.stream["id"] = current_stream
+
+        status, _, err = self.run_cli(TITLE, now=datetime(2026, 12, 21, tzinfo=tool.UTC))
+        self.assertEqual(status, 0, err)
+        self.assertEqual(self.google.items[-1]["snippet"]["description"], "Updated description")
+        self.assertEqual(tool.bound_stream(self.google.items[-1]), current_stream)
+        self.assertEqual(json.loads((self.config_dir / "config.json").read_text()), CONFIG)
+
+    def test_missing_template_blocks_scheduling(self):
+        self.google.template = None
+        status, out, err = self.run_cli(TITLE)
+        self.assertEqual((status, out, self.google.writes), (1, "", []))
+        self.assertIn("Run setup to choose a usable template broadcast", err)
 
     def test_non_reusable_template_stream_is_rejected(self):
         self.google.items = [broadcast(TEMPLATE, TUESDAY, stream=STREAM)]
