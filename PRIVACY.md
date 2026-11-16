@@ -1,4 +1,10 @@
-# schedule-stream Privacy Policy
+---
+layout: default
+title: Privacy Policy | schedule-stream by Peter Thiemann
+permalink: /privacy/
+---
+
+# schedule-stream by Peter Thiemann Privacy Policy
 
 Effective November 16, 2026
 

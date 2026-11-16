@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 UTC = timezone.utc
 SLOTS = {1: time(10, 15), 2: time(13)}
 CONFIG_DIR = Path.home() / "Library" / "Application Support" / "schedule-stream"
-PRIVACY_POLICY_URL = "https://github.com/peterthiemann/yt-stream-scheduler/blob/main/PRIVACY.md"
+PRIVACY_POLICY_URL = "https://peterthiemann.github.io/yt-stream-scheduler/privacy/"
 PRIVACY_POLICY_VERSION = 1
 YOUTUBE_TERMS_URL = "https://www.youtube.com/t/terms"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"

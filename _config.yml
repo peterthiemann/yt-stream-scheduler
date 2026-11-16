@@ -1,0 +1,5 @@
+title: schedule-stream by Peter Thiemann
+exclude:
+  - README.md
+  - schedule-stream
+  - test_schedule_stream.py
