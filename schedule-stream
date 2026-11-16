@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""Schedule YouTube Live broadcasts in the Tuesday and Wednesday Berlin slots."""
+
+import argparse
+import base64
+from collections import defaultdict
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta, timezone
+import fcntl
+import hashlib
+from http.client import HTTPException
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+from pathlib import Path
+import re
+import secrets
+import sys
+import tempfile
+from time import monotonic
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+import webbrowser
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+UTC = timezone.utc
+SLOTS = {1: time(10, 15), 2: time(13)}
+CONFIG_DIR = Path.home() / "Library" / "Application Support" / "schedule-stream"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+API_URL = "https://www.googleapis.com/youtube/v3/"
+SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+BROADCAST_PARTS = "snippet,status,contentDetails"
+VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+API_REASONS = {
+    "accessNotConfigured", "backendError", "forbidden", "insufficientLivePermissions",
+    "invalidAutoStart", "invalidAutoStop", "invalidDescription", "invalidEmbedSetting",
+    "invalidEnableClosedCaptions", "invalidLatencyPreferenceOptions", "invalidProjection",
+    "invalidScheduledEndTime", "invalidScheduledStartTime", "invalidTitle",
+    "liveBroadcastBindingNotAllowed", "liveBroadcastNotFound", "livePermissionBlocked",
+    "liveStreamNotFound", "liveStreamingNotEnabled", "quotaExceeded",
+    "scheduledEndTimeRequired", "userBroadcastsExceedLimit", "userRequestsExceedRateLimit",
+}
+
+
+class ToolError(Exception):
+    """An error safe to report on the command line."""
+
+
+class ApiError(ToolError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def ambiguous(self):
+        return self.status is None or self.status in (408, 429) or self.status >= 500
+
+
+class TemplateError(ToolError):
+    """A template selection that can be retried in setup."""
+
+
+class NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+HTTP = build_opener(NoRedirects())
+
+
+def request_json(request, operation, *, oauth=False):
+    try:
+        with HTTP.open(request, timeout=30) as response:
+            result = json.load(response)
+    except HTTPError as error:
+        detail = ""
+        with error:
+            try:
+                body = json.load(error)
+                if oauth and body.get("error") == "invalid_grant":
+                    detail = ". Run setup again to renew Google authorization"
+                elif not oauth:
+                    reason = body["error"]["errors"][0]["reason"]
+                    if reason in API_REASONS:
+                        detail = f" ({reason})"
+            except (AttributeError, HTTPException, IndexError, KeyError, OSError, TypeError, ValueError):
+                pass
+        raise ApiError(f"{operation} failed with HTTP {error.code}{detail}.", error.code) from None
+    except (HTTPException, OSError, URLError, ValueError):
+        raise ApiError(f"{operation} did not return a usable response.") from None
+    if not isinstance(result, dict):
+        raise ApiError(f"{operation} did not return a usable response.")
+    return result
+
+
+def oauth_token(client, **grant):
+    data = urlencode({**client, **grant}).encode("ascii")
+    request = Request(TOKEN_URL, data=data, headers={
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    result = request_json(request, "Google authorization", oauth=True)
+    if not result.get("access_token"):
+        raise ToolError("Google authorization did not return an access token. Run setup again.")
+    return result
+
+
+def sign_in(client):
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+    callback = {}
+
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def setup(self):
+            self.request.settimeout(3)
+            super().setup()
+
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            target = urlsplit(self.path)
+            params = parse_qs(target.query)
+            received_state = params.get("state", [""])[0]
+            if target.path != "/oauth" or not secrets.compare_digest(
+                received_state.encode("utf-8"), state.encode("ascii")
+            ):
+                self.send_error(404)
+                return
+
+            callback.update(params)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(b"Return to Terminal to continue setup.")
+
+    with HTTPServer(("127.0.0.1", 0), CallbackHandler) as server:
+        redirect = f"http://127.0.0.1:{server.server_port}/oauth"
+        params = {
+            "client_id": client["client_id"],
+            "redirect_uri": redirect,
+            "response_type": "code",
+            "scope": SCOPE,
+            "access_type": "offline",
+            "prompt": "select_account consent",
+            "state": state,
+            "code_challenge": challenge.rstrip(b"=").decode("ascii"),
+            "code_challenge_method": "S256",
+        }
+        stderr("Opening Google sign-in. Select your streaming channel if Google shows a channel picker.")
+        if not webbrowser.open(f"{AUTH_URL}?{urlencode(params)}"):
+            raise ToolError("Could not open your browser. Set a default browser and run setup again.")
+        deadline = monotonic() + 300
+        while not callback and (remaining := deadline - monotonic()) > 0:
+            server.timeout = min(1, remaining)
+            server.handle_request()
+
+    if not callback:
+        raise ToolError("Google sign-in timed out. Run setup again.")
+    if "error" in callback or not callback.get("code"):
+        raise ToolError("Google sign-in did not grant access. Run setup again.")
+    tokens = oauth_token(
+        client, grant_type="authorization_code", code=callback["code"][0],
+        code_verifier=verifier, redirect_uri=redirect,
+    )
+    if SCOPE not in tokens.get("scope", SCOPE).split() or not tokens.get("refresh_token"):
+        raise ToolError("Google did not grant ongoing YouTube access. Run setup again and grant access.")
+    return tokens
+
+
+class YouTube:
+    def __init__(self, access_token):
+        self.access_token = access_token
+
+    def call(self, method, resource, *, body=None, **params):
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            f"{API_URL}{resource}?{urlencode(params)}", headers=headers, method=method,
+            data=json.dumps(body).encode("utf-8") if body is not None else None,
+        )
+        return request_json(request, f"YouTube {method} {resource}")
+
+    def pages(self, resource, **params):
+        while True:
+            page = self.call("GET", resource, **params)
+            yield from page.get("items", [])
+            token = page.get("nextPageToken")
+            if not token:
+                return
+            params["pageToken"] = token
+
+    def channel(self):
+        channels = list(self.pages("channels", part="snippet", mine="true", maxResults=50))
+        if len(channels) != 1:
+            raise ToolError(f"Google authorized {len(channels)} YouTube channels. Sign in as one channel.")
+        return channels[0]["id"], channels[0]["snippet"]["title"]
+
+    def template(self, video_id, channel_id):
+        try:
+            broadcast = next(self.pages("liveBroadcasts", part=BROADCAST_PARTS, id=video_id), None)
+        except ApiError as error:
+            if error.status == 404:
+                raise TemplateError("YouTube could not find that broadcast.") from None
+            raise
+        if not broadcast or broadcast["snippet"]["channelId"] != channel_id:
+            raise TemplateError("That URL does not identify a live broadcast on the confirmed channel.")
+        stream_id = bound_stream(broadcast)
+        if not stream_id:
+            raise TemplateError("That broadcast has no bound stream.")
+        try:
+            stream = next(self.pages(
+                "liveStreams", part="snippet,contentDetails", id=stream_id,
+                fields="nextPageToken,items(id,snippet(channelId),contentDetails(isReusable))",
+            ), None)
+        except ApiError as error:
+            if error.status == 404:
+                raise TemplateError("The bound stream is no longer available.") from None
+            raise
+        if not stream or stream["id"] != stream_id or stream["snippet"]["channelId"] != channel_id:
+            raise TemplateError("The bound stream is unavailable on the confirmed channel.")
+        if stream.get("contentDetails", {}).get("isReusable") is not True:
+            raise TemplateError("The bound stream is not marked reusable.")
+        return stream_id, template_settings(broadcast)
+
+    def upcoming(self, channel_id):
+        for broadcast in self.pages(
+            "liveBroadcasts", part=BROADCAST_PARTS, broadcastStatus="upcoming",
+            broadcastType="all", maxResults=50,
+        ):
+            if broadcast["snippet"]["channelId"] == channel_id:
+                yield broadcast
+
+    def insert(self, body):
+        result = self.call("POST", "liveBroadcasts", part=",".join(body), body=body)
+        if not VIDEO_ID.fullmatch(result.get("id") or ""):
+            raise ApiError("YouTube did not return a broadcast ID after creation.")
+        return result
+
+    def bind(self, broadcast_id, stream_id):
+        result = self.call(
+            "POST", "liveBroadcasts/bind", part="contentDetails", id=broadcast_id,
+            streamId=stream_id,
+        )
+        if bound_stream(result) != stream_id:
+            raise ApiError("YouTube did not confirm the requested stream binding.")
+
+
+def stderr(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def prompt(message):
+    print(message, end="", file=sys.stderr, flush=True)
+    return input().strip()
+
+
+def video_id_from_url(value):
+    try:
+        url = urlsplit(value)
+        pieces = url.path.strip("/").split("/")
+        if url.scheme in ("http", "https"):
+            if url.hostname == "youtu.be" and len(pieces) == 1:
+                video_id = pieces[0]
+            elif url.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+                if url.path == "/watch":
+                    video_id = parse_qs(url.query).get("v", [""])[0]
+                elif len(pieces) == 2 and pieces[0] == "live":
+                    video_id = pieces[1]
+                else:
+                    video_id = ""
+            else:
+                video_id = ""
+            if VIDEO_ID.fullmatch(video_id):
+                return video_id
+    except ValueError:
+        pass
+    raise TemplateError("Enter a YouTube watch URL, a youtu.be URL, or a YouTube /live/ URL.")
+
+
+def bound_stream(broadcast):
+    return broadcast.get("contentDetails", {}).get("boundStreamId")
+
+
+def copy_fields(source, *keys):
+    return {key: source[key] for key in keys if source.get(key) is not None}
+
+
+def instant(value):
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if timestamp.tzinfo is not None:
+            return timestamp.astimezone(UTC)
+    except (AttributeError, ValueError, OverflowError):
+        pass
+    raise ToolError("YouTube returned an invalid scheduled timestamp.")
+
+
+def rfc3339(value):
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def template_settings(broadcast):
+    snippet = broadcast["snippet"]
+    details = broadcast.get("contentDetails", {})
+    settings = {
+        "snippet": copy_fields(snippet, "description", "categoryId"),
+        "status": copy_fields(broadcast.get("status", {}), "selfDeclaredMadeForKids"),
+        "contentDetails": copy_fields(
+            details, "enableAutoStart", "enableAutoStop", "enableDvr", "enableEmbed",
+            "recordFromStart", "latencyPreference", "projection",
+        ),
+    }
+    if snippet.get("scheduledStartTime") and snippet.get("scheduledEndTime"):
+        duration = instant(snippet["scheduledEndTime"]) - instant(snippet["scheduledStartTime"])
+        if duration > timedelta():
+            settings["durationSeconds"] = duration.total_seconds()
+
+    content = settings["contentDetails"]
+    monitor = copy_fields(details.get("monitorStream", {}), "enableMonitorStream", "broadcastStreamDelayMs")
+    if monitor:
+        content["monitorStream"] = monitor
+    content.update(copy_fields(details, "closedCaptionsType")
+                   or copy_fields(details, "enableClosedCaptions"))
+    if "latencyPreference" not in content:
+        content.update(copy_fields(details, "enableLowLatency"))
+
+    # Region rules can be written on upcoming broadcasts. Availability time windows cannot.
+    availability = details.get("availabilityConfig", {})
+    regions = {}
+    global_rules = copy_fields(availability.get("globalConfig", {}), "excludedRegionCodes")
+    if global_rules:
+        regions["globalConfig"] = global_rules
+    region_codes = sorted({
+        rule["regionCode"] for rule in availability.get("regionsConfig", {}).get("regionIntervals", [])
+        if rule.get("regionCode")
+    })
+    if region_codes:
+        regions["regionsConfig"] = {"regionIntervals": [{"regionCode": code} for code in region_codes]}
+    if regions:
+        content["availabilityConfig"] = regions
+    return settings
+
+
+def insert_body(settings, title, slot):
+    body = {
+        "snippet": {**settings["snippet"], "title": title, "scheduledStartTime": rfc3339(slot)},
+        "status": {**settings["status"], "privacyStatus": "unlisted"},
+    }
+    if settings["contentDetails"]:
+        body["contentDetails"] = settings["contentDetails"]
+    if "durationSeconds" in settings:
+        end = slot.astimezone(UTC) + timedelta(seconds=settings["durationSeconds"])
+        body["snippet"]["scheduledEndTime"] = rfc3339(end)
+    return body
+
+
+@contextmanager
+def local_lock():
+    # Serialize local check/insert/bind runs and setup replacements.
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    CONFIG_DIR.chmod(0o700)
+    with (CONFIG_DIR / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def read_json(path, problem):
+    try:
+        with path.open(encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        raise ToolError(problem) from None
+
+
+def save_config(config):
+    file = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=CONFIG_DIR, delete=False)
+    temporary = Path(file.name)
+    try:
+        with file:
+            json.dump(config, file)
+            file.write("\n")
+        temporary.replace(CONFIG_DIR / "config.json")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def setup(credentials):
+    downloaded = read_json(credentials.expanduser(), "Could not read the Desktop OAuth credentials JSON.")
+    try:
+        installed = downloaded["installed"]
+        client = {key: installed[key] for key in ("client_id", "client_secret")}
+        if not all(isinstance(value, str) and value for value in client.values()):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise ToolError("Use the credentials JSON downloaded for a Desktop OAuth client.") from None
+
+    while True:
+        tokens = sign_in(client)
+        youtube = YouTube(tokens["access_token"])
+        try:
+            channel_id, channel_name = youtube.channel()
+        except ApiError:
+            raise
+        except ToolError as error:
+            stderr(str(error))
+        else:
+            stderr(f"Authorized channel: {channel_name} ({channel_id})")
+            if prompt("Use this channel? [y/N] ").lower() in ("y", "yes"):
+                break
+        if prompt("Restart Google sign-in? [Y/n] ").lower() not in ("", "y", "yes"):
+            raise ToolError("Setup cancelled.")
+
+    while True:
+        value = prompt("Template broadcast watch URL (blank to cancel): ")
+        if not value:
+            raise ToolError("Setup cancelled.")
+        try:
+            stream_id, settings = youtube.template(video_id_from_url(value), channel_id)
+            break
+        except TemplateError as error:
+            stderr(f"{error} Try a different broadcast.")
+
+    with local_lock():
+        save_config({
+            "client": client, "refresh_token": tokens["refresh_token"], "channel_id": channel_id,
+            "stream_id": stream_id, "settings": settings,
+        })
+    stderr("Setup complete. The confirmed channel and reusable stream were saved.")
+
+
+def show_slot(slot):
+    return slot.strftime("%Y-%m-%d %H:%M %Z") + " (Europe/Berlin)"
+
+
+def slot_on(day, berlin):
+    return datetime.combine(day, SLOTS[day.weekday()], tzinfo=berlin)
+
+
+def select_slot(now, berlin, requested_date, occupied, diagnostic):
+    if requested_date is not None:
+        return slot_on(requested_date, berlin)
+
+    day = now.astimezone(berlin).date()
+    while True:
+        if day.weekday() in SLOTS:
+            slot = slot_on(day, berlin)
+            if slot > now:
+                if slot not in occupied:
+                    return slot
+                ids = ", ".join(occupied[slot])
+                diagnostic(f"Skipped occupied slot {show_slot(slot)} ({ids}).")
+        day += timedelta(days=1)
+
+
+def broadcasts_by_slot(youtube, channel_id):
+    occupied = defaultdict(dict)
+    for broadcast in youtube.upcoming(channel_id):
+        start = broadcast["snippet"].get("scheduledStartTime")
+        if start:
+            occupied[instant(start)][broadcast["id"]] = broadcast
+    return occupied
+
+
+def check_existing(broadcasts, slot, title, stream_id):
+    if not broadcasts:
+        return None
+    if len(broadcasts) == 1:
+        broadcast = next(iter(broadcasts.values()))
+        if (broadcast["snippet"]["title"] == title
+                and broadcast["status"]["privacyStatus"] == "unlisted"):
+            if bound_stream(broadcast) not in (None, "", stream_id):
+                raise ToolError(
+                    f"Conflict at {show_slot(slot)}. Broadcast {broadcast['id']} "
+                    "is bound to a different stream."
+                )
+            return broadcast
+
+    ids = ", ".join(broadcasts)
+    raise ToolError(f"Conflict at {show_slot(slot)}. The slot is occupied by {ids}.")
+
+
+def create_or_recover(youtube, config, slot, title, diagnostic):
+    try:
+        broadcast = youtube.insert(insert_body(config["settings"], title, slot))
+    except ApiError as error:
+        if not error.ambiguous:
+            raise
+        retry = f"Retry with --date {slot.date()} and the same title."
+        diagnostic("Creation was uncertain. Checking the same slot on YouTube.")
+        try:
+            occupied = broadcasts_by_slot(youtube, config["channel_id"])
+        except ToolError as check_error:
+            raise ToolError(
+                f"Creation at {show_slot(slot)} is uncertain. {check_error} {retry}"
+            ) from None
+        existing = check_existing(occupied.get(slot), slot, title, config["stream_id"])
+        if existing is None:
+            raise ToolError(
+                f"Creation at {show_slot(slot)} is uncertain. YouTube lists no broadcast "
+                f"in that slot yet. {retry}"
+            ) from None
+        diagnostic(f"Recovered broadcast {existing['id']} after the uncertain create response.")
+        return existing
+    diagnostic(f"Created broadcast {broadcast['id']}.")
+    return broadcast
+
+
+def schedule(youtube, config, title, requested_date, dry_run, verbose, now):
+    diagnostic = stderr if verbose else lambda _message: None
+    berlin = ZoneInfo("Europe/Berlin")
+    if requested_date is not None and (
+        requested_date.weekday() not in SLOTS or slot_on(requested_date, berlin) <= now
+    ):
+        raise ToolError("--date must select a future Tuesday at 10:15 or Wednesday at 13:00 in Europe/Berlin.")
+
+    channel_id, channel_name = youtube.channel()
+    diagnostic(f"Authorized channel: {channel_name} ({channel_id})")
+    if channel_id != config["channel_id"]:
+        raise ToolError(
+            f"Channel mismatch. Google authorized {channel_name} ({channel_id}). "
+            f"Expected {config['channel_id']}. Run setup to sign in again."
+        )
+
+    occupied = broadcasts_by_slot(youtube, channel_id)
+    slot = select_slot(now, berlin, requested_date, occupied, diagnostic)
+    if verbose or dry_run:
+        stderr(f"Selected slot: {show_slot(slot)}.")
+    stream_id = config["stream_id"]
+    existing = check_existing(occupied.get(slot), slot, title, stream_id)
+
+    if dry_run:
+        if existing is None:
+            stderr(f"Would create an unlisted broadcast titled {title!r} and bind the saved stream.")
+        elif bound_stream(existing) == stream_id:
+            stderr(f"Would reuse broadcast {existing['id']}. The saved stream is already bound.")
+        else:
+            stderr(f"Would reuse broadcast {existing['id']} and bind the saved stream.")
+        return None
+
+    if existing is not None:
+        broadcast = existing
+        diagnostic(f"Reused broadcast {broadcast['id']}.")
+    else:
+        broadcast = create_or_recover(youtube, config, slot, title, diagnostic)
+    broadcast_id = broadcast["id"]
+    binding = bound_stream(broadcast)
+    if binding == stream_id:
+        diagnostic("The saved stream is already bound.")
+    elif binding:
+        raise ToolError(f"Conflict at {show_slot(slot)}. Broadcast {broadcast_id} has a different stream.")
+    else:
+        try:
+            youtube.bind(broadcast_id, stream_id)
+        except ApiError as error:
+            raise ToolError(
+                f"Binding failed for broadcast {broadcast_id} at {show_slot(slot)}. {error} "
+                f"Retry with --date {slot.date()} and the same title."
+            ) from None
+        diagnostic("Bound the saved stream.")
+    return f"https://www.youtube.com/watch?v={broadcast_id}"
+
+
+def parse_date(value):
+    try:
+        if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            return date.fromisoformat(value)
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("expected a valid date in YYYY-MM-DD format")
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    try:
+        if args[:1] == ["setup"]:
+            parser = argparse.ArgumentParser(prog="schedule-stream setup")
+            parser.add_argument("--credentials", required=True, type=Path, help="Desktop OAuth JSON path")
+            setup(parser.parse_args(args[1:]).credentials)
+            return 0
+
+        parser = argparse.ArgumentParser(
+            prog="schedule-stream",
+            description="Schedule an unlisted YouTube Live broadcast (run schedule-stream setup first).",
+        )
+        parser.add_argument("title", help="title for this broadcast")
+        parser.add_argument("--date", type=parse_date, help="future slot date (YYYY-MM-DD, Europe/Berlin)")
+        parser.add_argument("--dry-run", action="store_true", help="report the plan without changing YouTube")
+        parser.add_argument("-v", "--verbose", action="store_true", help="show details on stderr")
+        options = parser.parse_args(args)
+        if not options.title.strip() or len(options.title) > 100:
+            parser.error("title must contain 1 to 100 characters and cannot be blank")
+
+        with local_lock():
+            config = read_json(
+                CONFIG_DIR / "config.json",
+                "Could not read saved setup. Run schedule-stream setup --credentials PATH.",
+            )
+            tokens = oauth_token(
+                config["client"], grant_type="refresh_token", refresh_token=config["refresh_token"],
+            )
+            url = schedule(
+                YouTube(tokens["access_token"]), config, options.title, options.date, options.dry_run,
+                options.verbose, datetime.now(UTC),
+            )
+        if url:
+            print(url)
+        return 0
+    except ToolError as error:
+        stderr(f"Error: {error}")
+    except (EOFError, KeyboardInterrupt):
+        stderr("Cancelled.")
+    except ZoneInfoNotFoundError:
+        stderr("Error: Europe/Berlin time zone data is unavailable. Use a Python installation with time zone data.")
+    except OSError:
+        stderr("Error: A local file or connection could not be opened. Check access and try again.")
+    except (KeyError, TypeError, ValueError):
+        stderr("Error: Saved setup or the Google API response contained unexpected data.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
