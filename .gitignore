@@ -1,0 +1,9 @@
+# Google OAuth credentials and local authorization
+client_secret*.json
+credentials.json
+token.json
+/config.json
+
+# Python bytecode
+__pycache__/
+*.py[co]
