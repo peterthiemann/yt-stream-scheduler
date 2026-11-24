@@ -83,7 +83,12 @@ def request_json(request, operation, *, oauth=False):
             try:
                 body = json.load(error)
                 if oauth and body.get("error") == "invalid_grant":
-                    detail = ". Run setup again to renew Google authorization"
+                    detail = (
+                        " (invalid_grant). Sign in again with "
+                        "'schedule-stream setup --credentials /path/to/client_secret.json' "
+                        "using your Desktop OAuth JSON, then rerun your scheduling command. "
+                        "The authorized channel ID will be checked against your saved setup before scheduling"
+                    )
                 elif not oauth:
                     reason = body["error"]["errors"][0]["reason"]
                     if reason in API_REASONS:

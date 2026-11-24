@@ -9,11 +9,13 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
 loader = SourceFileLoader("schedule_stream", str(Path(__file__).with_name("schedule-stream")))
 tool = module_from_spec(spec_from_loader(loader.name, loader))
 loader.exec_module(tool)
+REAL_REQUEST_JSON = tool.request_json
 
 MONDAY = datetime(2026, 11, 16, 9, tzinfo=tool.UTC)
 TUESDAY = "2026-11-17T09:15:00Z"
@@ -204,6 +206,40 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("Channel mismatch", err)
         self.assertIn(CHANNEL, err)
         self.assertIn("UCOtherChannel", err)
+
+    def test_invalid_grant_aborts_before_any_broadcast_write(self):
+        original_config = (self.config_dir / "config.json").read_bytes()
+        failure = HTTPError(
+            tool.TOKEN_URL, 400, "Bad Request", {},
+            io.BytesIO(b'{"error":"invalid_grant","error_description":"private server detail"}'),
+        )
+
+        def respond(request, operation, *, oauth=False):
+            if oauth:
+                return REAL_REQUEST_JSON(request, operation, oauth=True)
+            return self.google.request(request, operation)
+
+        with patch.object(tool, "request_json", side_effect=respond), \
+                patch.object(tool.HTTP, "open", side_effect=failure):
+            status, out, err = self.run_cli(TITLE)
+
+        self.assertEqual((status, out), (1, ""))
+        self.assertEqual(self.google.writes, [])
+        self.assertEqual(self.google.reads, [])
+        self.assertEqual((self.config_dir / "config.json").read_bytes(), original_config)
+        self.assertIn("invalid_grant", err)
+        self.assertIn("setup --credentials /path/to/client_secret.json", err)
+        self.assertIn("rerun your scheduling command", err)
+        self.assertNotIn("private server detail", err)
+        self.assertNotIn(CONFIG["refresh_token"], err)
+
+        # A successful subsequent refresh must still verify the saved channel.
+        self.google.channel_id = "UCOtherChannel"
+        status, out, err = self.run_cli(TITLE)
+        self.assertEqual((status, out), (1, ""))
+        self.assertIn("Channel mismatch", err)
+        self.assertEqual(self.google.writes, [])
+        self.assertEqual([name for name, _ in self.google.reads], ["channels"])
 
     def test_binding_failure_is_recoverable_by_date_and_title(self):
         self.google.bind_error = tool.ApiError("YouTube returned HTTP 503.", 503)
